@@ -27,3 +27,5 @@ Thumbs.db
 # Data 
 *.csv
 *.json
+bot_heartbeat.ts
+*.ts
