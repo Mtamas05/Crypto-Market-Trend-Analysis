@@ -1,0 +1,19 @@
+[Unit]
+Description=Pro Crypto Bot V5 Engine
+After=network.target
+
+[Service]
+Type=simple
+User=tamas
+WorkingDirectory=/home/tamas/pro_bot
+ExecStart=/usr/bin/python3 -u pro_bot_v5_pi.py
+Restart=always
+RestartSec=5s
+StandardOutput=append:/home/tamas/pro_bot/bot_system.log
+StandardError=append:/home/tamas/pro_bot/bot_error.log
+
+# Memória és erőforrás-védelem
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

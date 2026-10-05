@@ -40,12 +40,19 @@ Indítás:
 import os, sys, time, json, hmac, hashlib, logging
 import sqlite3, threading, schedule, requests
 import numpy as np, pandas as pd
+from quant.deep_quant import calculate_hurst_exponent, calculate_ou_halflife, KalmanMovingBeta
+from quant.quant_arsenal import VPINCalculator, calculate_chandelier_exit, compute_cross_asset_zscore
 from datetime import datetime, timedelta
 from sklearn.cluster import KMeans
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 import asyncio
 import websockets
+import tools.reporter as reporter
+try:
+    from quant.meta_labeler import evaluate_trade_meta
+except ImportError:
+    evaluate_trade_meta = None
 
 from config import TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, BINANCE_API_KEY, BINANCE_SECRET
 try:
@@ -127,7 +134,7 @@ EXECUTION_MODE = "PAPER"
 LIVE_TRADING   = (EXECUTION_MODE == "LIVE")
 # PAPER és LIVE mostantól külön fájlokat használ — így egy módváltás nem
 # keveri össze a papír-egyenleget az éles tőkével.
-DB_PATH        = f"bot_v5_{EXECUTION_MODE.lower()}.db"
+DB_PATH        = f"data/bot_v5_{EXECUTION_MODE.lower()}.db"
 STATE_FILE_SUFFIX = EXECUTION_MODE.lower()
 
 # FIGYELEM: minden BASE_SYMBOLS-beli coinnak legyen itt bejegyzése — a .get()
@@ -136,12 +143,15 @@ STATE_FILE_SUFFIX = EXECUTION_MODE.lower()
 PRECISIONS       = {"BTCUSDT":3,"ETHUSDT":3,"SOLUSDT":2,"BNBUSDT":2,"FETUSDT":1,"AVAXUSDT":1}
 PRICE_PRECISIONS = {"BTCUSDT":1,"ETHUSDT":2,"SOLUSDT":3,"BNBUSDT":2,"FETUSDT":4,"AVAXUSDT":3}
 MIN_QTY          = {"BTCUSDT":0.001,"ETHUSDT":0.001,"SOLUSDT":0.01,"BNBUSDT":0.01,"FETUSDT":1,"AVAXUSDT":0.1}
+TICK_SIZES       = {"BTCUSDT":0.1,"ETHUSDT":0.01,"SOLUSDT":0.001,"BNBUSDT":0.01,"FETUSDT":0.0001,"AVAXUSDT":0.001}
 
 # ── Logging ──────────────────────────────────────────────────────
+sys.stdout.reconfigure(encoding="utf-8")
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.FileHandler("bot_v5.log"), logging.StreamHandler(sys.stdout)],
+    handlers=[logging.FileHandler("bot_v5.log", encoding="utf-8"), logging.StreamHandler(sys.stdout)],
+    force=True
 )
 log = logging.getLogger("probot")
 
@@ -149,6 +159,7 @@ log = logging.getLogger("probot")
 #  🗄️  ADATBÁZIS
 # ══════════════════════════════════════════════════════════════════
 DB_LOCK = threading.Lock()
+STATE_LOCK = threading.RLock()
 
 def db_connect():
     return sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -193,6 +204,23 @@ def db_exec(sql, params=()):
         finally:
             con.close()
 
+
+def db_maintenance():
+    with DB_LOCK:
+        con = db_connect()
+        try:
+            log.info("🧹 DB Karbantartás...")
+            cutoff = time.time() - (90 * 86400)
+            con.execute("DELETE FROM decisions WHERE ts < ?", (cutoff,))
+            con.execute("DELETE FROM equity WHERE ts < ?", (cutoff,))
+            con.commit()
+            con.execute("VACUUM")
+            log.info("✅ DB Karbantartás kész.")
+        except Exception as e:
+            log.error("DB karbantartás hiba: %s", e)
+        finally:
+            con.close()
+
 def db_fetch(sql, params=()):
     with DB_LOCK:
         con = db_connect()
@@ -206,7 +234,7 @@ def db_fetch(sql, params=()):
 # ══════════════════════════════════════════════════════════════════
 #  🧠  ÁLLAPOT
 # ══════════════════════════════════════════════════════════════════
-STATE_FILE = f"bot_state_{STATE_FILE_SUFFIX}.json"
+STATE_FILE     = f"data/bot_state_{STATE_FILE_SUFFIX}.json"
 state = {
     "total_capital": INITIAL_CAPITAL, "peak_capital": INITIAL_CAPITAL,
     "start_of_day_capital": INITIAL_CAPITAL, "last_report_day": 0,
@@ -216,6 +244,16 @@ state = {
     "coin_weights": {c:1.0/len(BASE_SYMBOLS) for c in BASE_SYMBOLS},
     "active_pos": {c:None for c in BASE_SYMBOLS},
     "entry_prices": {c:0.0 for c in BASE_SYMBOLS},
+    "entry_ts": {c:0.0 for c in BASE_SYMBOLS},
+    "highest_high": {c:0.0 for c in BASE_SYMBOLS},
+    "lowest_low": {c:float('inf') for c in BASE_SYMBOLS},
+    "baseline_vol": {c:0.0 for c in BASE_SYMBOLS},
+    "bocpd_event": False,
+    "entry_ts": {c:0.0 for c in BASE_SYMBOLS},
+    "highest_high": {c:0.0 for c in BASE_SYMBOLS},
+    "lowest_low": {c:float('inf') for c in BASE_SYMBOLS},
+    "baseline_vol": {c:0.0 for c in BASE_SYMBOLS},
+    "bocpd_event": False,
     "stop_losses": {c:0.0 for c in BASE_SYMBOLS},
     "target_prices": {c:0.0 for c in BASE_SYMBOLS},
     "stakes": {c:0.0 for c in BASE_SYMBOLS},
@@ -459,6 +497,14 @@ def update_active_symbols():
                 if c not in state["active_pos"]:
                     state["active_pos"][c] = None
                     state["entry_prices"][c] = 0.0
+                    state["entry_ts"][c] = 0.0
+                    state["highest_high"][c] = 0.0
+                    state["lowest_low"][c] = float('inf')
+                    state["baseline_vol"][c] = 0.0
+                    state["entry_ts"][c] = 0.0
+                    state["highest_high"][c] = 0.0
+                    state["lowest_low"][c] = float('inf')
+                    state["baseline_vol"][c] = 0.0
                     state["stop_losses"][c]  = 0.0
                     state["target_prices"][c]= 0.0
                     state["stakes"][c]       = 0.0
@@ -468,6 +514,7 @@ def update_active_symbols():
             save_state()
             tg_send(f"🔄 Coin rotáció!\nRégi: {', '.join(old)}\nÚj: {', '.join(selected)}\n"
                     f"(alap 4: {', '.join(core)} mindig bent, csak az extra helyek rotálnak)")
+            _ws_restart_event.set()
             log.info("Coin rotáció: %s → %s", old, selected)
         else:
             log.info("Coin rotáció: nincs változás (%s)", selected)
@@ -495,6 +542,47 @@ def update_vol_filter():
 # ÚJ: gördülő árkorreláció-mátrix az aktív coinok között
 CORRELATION_LOOKBACK_DAYS = 30
 CORRELATION_THRESHOLD     = 0.7   # e fölött "ugyanaz a kockázat" — lásd correlated_exposure_count
+
+def update_bocpd():
+    """
+    BOCPD Proxy (Bayesian Online Change-Point Detection).
+    A BTCUSDT 15 perces hozamainak eloszlását vizsgálja. Ha az utolsó 5 gyertya
+    varianciája/átlaga extrém módon (>3 Z-score) eltér a korábbi 100 gyertya
+    eloszlásától, akkor hirtelen rezsimváltást (Change-Point) regisztrál.
+    """
+    try:
+        df = fetch_klines("BTCUSDT", "15m", limit=120)
+        if len(df) < 50: return
+        
+        returns = df["close"].pct_change().dropna()
+        hist_ret = returns.iloc[:-10]
+        recent_ret = returns.iloc[-5:]
+        
+        mu_hist, std_hist = hist_ret.mean(), hist_ret.std()
+        recent_var = recent_ret.var()
+        hist_var = hist_ret.var()
+        
+        var_ratio = recent_var / hist_var if hist_var > 0 else 1.0
+        
+        prob_cp = 0.0
+        if var_ratio > 4.0: prob_cp += 0.4
+        if abs(recent_ret.mean() - mu_hist) > 3 * std_hist: prob_cp += 0.4
+            
+        with STATE_LOCK:
+            was_bocpd = state.get("bocpd_event", False)
+            if prob_cp > 0.65:
+                state["bocpd_event"] = True
+                if not was_bocpd:
+                    log.warning("🚨 BOCPD: Rezsimváltás (Change-Point) detektálva! Stopok szűkítve, belépések felfüggesztve.")
+                    tg_send("🚨 BOCPD: Hirtelen piaci rezsimváltás detektálva! Védekezési mód aktiválva.")
+            else:
+                state["bocpd_event"] = False
+                if was_bocpd:
+                    log.info("BOCPD: Piac stabilizálódott.")
+                    tg_send("✅ BOCPD: Piac stabilizálódott, normál mód visszaállítva.")
+            save_state()
+    except Exception as e:
+        log.error("BOCPD hiba: %s", e)
 
 def update_correlation_matrix():
     """
@@ -1163,7 +1251,12 @@ def execute_maker_chase(sym, side, qty, max_slip_pct=0.0005, chase_seconds=6):
 #  🔌 WEBSOCKET MANAGER (Zero Polling)
 # ══════════════════════════════════════════════════════════════════
 WS_DATA_LOCK = threading.Lock()
-LIVE_PRICES = {}       # {"BTCUSDT": 65420.5, ...}
+_ws_restart_event = threading.Event()
+LIVE_PRICES = {}
+CVD_SLOPES = {}
+kalman_trackers = {c: KalmanMovingBeta() for c in BASE_SYMBOLS}
+vpin_trackers = {c: VPINCalculator() for c in BASE_SYMBOLS}
+BTC_MOMENTUM_EVENT = False       # {"BTCUSDT": 65420.5, ...}
 CLOSED_CANDLES_QUEUE = []  # Események: (symbol, interval, close_price)
 
 async def binance_kline_stream(symbols, intervals=["1h", "4h"]):
@@ -1193,6 +1286,59 @@ async def binance_kline_stream(symbols, intervals=["1h", "4h"]):
             log.error("WebSocket Klines hiba: %s. Újracsatlakozás 5s múlva...", e)
             await asyncio.sleep(5)
 
+async def binance_aggtrade_stream(symbols):
+    global BTC_MOMENTUM_EVENT
+    streams = [f"{s.lower()}@aggTrade" for s in symbols]
+    stream_path = "/".join(streams)
+    url = f"wss://fstream.binance.com/stream?streams={stream_path}" if LIVE_TRADING else f"wss://stream.binancefuture.com/stream?streams={stream_path}"
+    
+    cvd_data = {s: [] for s in symbols}
+    btc_recent = []
+    
+    while True:
+        try:
+            async with websockets.connect(url, ping_interval=20, ping_timeout=10) as ws:
+                log.info("🔌 WebSocket kapcsolat kiépítve: AggTrade (CVD)")
+                while True:
+                    msg = await ws.recv()
+                    data = json.loads(msg)
+                    if "data" in data:
+                        sym = data["data"]["s"]
+                        qty = float(data["data"]["q"])
+                        price = float(data["data"]["p"])
+                        is_mm = data["data"]["m"]
+                        delta = -qty if is_mm else qty
+                        
+                        now = time.time()
+                        cvd_data.setdefault(sym, []).append((now, delta))
+                        # Cleanup old data (keep last 15 mins)
+                        cvd_data[sym] = [x for x in cvd_data[sym] if now - x[0] <= 900]
+                        CVD_SLOPES[sym] = sum(x[1] for x in cvd_data[sym])
+                        vpin_trackers[sym].update_trade(price, qty, is_mm)
+                        if sym == "BTCUSDT":
+                            state["_btc_last_price"] = price
+                        else:
+                            btc_p = state.get("_btc_last_price", price)
+                            _, _, err = kalman_trackers[sym].update(price, btc_p)
+                            state.setdefault("_kalman_err", {})[sym] = err
+                        
+                        # BTC Lead-Lag Arbitrage Detection (30 sec momentum)
+                        if sym == "BTCUSDT":
+                            btc_recent.append((now, price))
+                            btc_recent = [x for x in btc_recent if now - x[0] <= 30]
+                            if len(btc_recent) > 10:
+                                p_start = btc_recent[0][1]
+                                p_end = btc_recent[-1][1]
+                                if (p_end - p_start) / p_start > 0.004:
+                                    if not BTC_MOMENTUM_EVENT:
+                                        log.warning("🚨 BTC LEAD-LAG ARBITRÁZS EVENT DETEKTÁLVA! Készültség az altcoinokra!")
+                                    BTC_MOMENTUM_EVENT = True
+                                else:
+                                    BTC_MOMENTUM_EVENT = False
+                                    
+        except Exception as e:
+            await asyncio.sleep(5)
+
 async def binance_bookticker_stream(symbols):
     streams = [f"{s.lower()}@bookTicker" for s in symbols]
     stream_path = "/".join(streams)
@@ -1216,15 +1362,29 @@ async def binance_bookticker_stream(symbols):
             log.error("WebSocket BookTicker hiba: %s. Újracsatlakozás 5s múlva...", e)
             await asyncio.sleep(5)
 
-def start_websocket_manager(symbols):
-    async def run_streams():
-        await asyncio.gather(
-            binance_kline_stream(symbols),
-            binance_bookticker_stream(symbols)
-        )
+async def websocket_watcher(tasks):
+    while not _ws_restart_event.is_set():
+        await asyncio.sleep(1)
+    for t in tasks:
+        t.cancel()
+
+def start_websocket_manager():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    loop.run_until_complete(run_streams())
+    while True:
+        symbols = state["active_symbols"]
+        _ws_restart_event.clear()
+        
+        t1 = loop.create_task(binance_kline_stream(symbols))
+        t2 = loop.create_task(binance_bookticker_stream(symbols))
+        t3 = loop.create_task(binance_aggtrade_stream(symbols))
+        watcher = loop.create_task(websocket_watcher([t1, t2, t3]))
+        
+        try:
+            loop.run_until_complete(asyncio.gather(t1, t2, t3, watcher))
+        except asyncio.CancelledError:
+            log.info("🔌 WebSocket szálak leállítva, újraindítás új szimbólumokkal...")
+
 
 # ══════════════════════════════════════════════════════════════════
 #  🚀  FŐ KERESKEDÉSI LOGIKA
@@ -1252,7 +1412,56 @@ def evaluate_entry(coin, price=None):
         dema   = ind_ema(df_1d["close"], EMA_DAILY_LEN)
         dtrend = "BULL" if dp > dema else "BEAR"
 
+    # 14-napos Swing szintek meghatározása
+    swing_high, swing_low = None, None
+    if not df_1d.empty and len(df_1d) >= 15:
+        df_1d_recent = df_1d.iloc[-15:-1]
+        swing_high = float(df_1d_recent["high"].max())
+        swing_low = float(df_1d_recent["low"].min())
+        
     ob  = fetch_ob_imbalance(coin)
+    vpin = vpin_trackers[coin].get_vpin()
+    
+    # 1. FRAKTÁLIS REZSIM SZŰRŐ (Hurst Exponens)
+    hurst = calculate_hurst_exponent(df_4h["close"].values)
+    
+    # 2. OU Half-Life
+    if not df_1h.empty:
+        ou_hl = calculate_ou_halflife(df_1h["close"].values)
+    else:
+        ou_hl = 999.0
+    
+    # Kalmán-szűrő Innováció (Prediction Error) a Z-Score helyett
+    kalman_errs = state.get("_kalman_err", {})
+    if coin in kalman_errs:
+        # Normalizáljuk a hibát, hogy Z-score szerű legyen (nagyon durva közelítés)
+        # Egy komolyabb verzióban a hiba szórásával osztanánk (self.P)
+        # Itt most feltételezzük, hogy az árhoz képest vett %-os eltérés ad egy mutatót
+        # Használjuk az OLS Z-score-t baseline-nak, de ha van Kalman, az finomítja
+        df_alt = fetch_klines(coin, "1d", limit=30)
+        df_btc = fetch_klines("BTCUSDT", "1d", limit=30)
+        if not df_alt.empty and not df_btc.empty and len(df_alt) >= 20 and len(df_btc) >= 20:
+            r_alt = df_alt["close"].pct_change().dropna().values
+            r_btc = df_btc["close"].pct_change().dropna().values
+            min_len = min(len(r_alt), len(r_btc))
+            z_score = compute_cross_asset_zscore(r_alt[-min_len:], r_btc[-min_len:])
+            
+            # Kalman override a lokális extremitásokhoz
+            k_err_pct = kalman_errs[coin] / price
+            if k_err_pct > 0.05: z_score = max(z_score, 3.0)
+            elif k_err_pct < -0.05: z_score = min(z_score, -3.0)
+        else:
+            z_score = 0.0
+    else:
+        df_alt = fetch_klines(coin, "1d", limit=30)
+        df_btc = fetch_klines("BTCUSDT", "1d", limit=30)
+        if not df_alt.empty and not df_btc.empty and len(df_alt) >= 20 and len(df_btc) >= 20:
+            r_alt = df_alt["close"].pct_change().dropna().values
+            r_btc = df_btc["close"].pct_change().dropna().values
+            min_len = min(len(r_alt), len(r_btc))
+            z_score = compute_cross_asset_zscore(r_alt[-min_len:], r_btc[-min_len:])
+        else:
+            z_score = 0.0
     oi  = fetch_oi_change(coin)
     fr  = fetch_funding(coin)
     
@@ -1268,6 +1477,14 @@ def evaluate_entry(coin, price=None):
             log_dec(coin,price,dp,ema,atr,adx,rsi,dh,dl,ob,oi,dtrend,f"FILTERED_{reason}")
             return
 
+        if state.get("bocpd_event", False):
+            log_dec(coin,price,dp,ema,atr,adx,rsi,dh,dl,ob,oi,dtrend,"FILTERED_BOCPD")
+            return
+
+        if state.get("bocpd_event", False):
+            log_dec(coin,price,dp,ema,atr,adx,rsi,dh,dl,ob,oi,dtrend,"FILTERED_BOCPD")
+            return
+
         if is_cooldown():
             log_dec(coin,price,dp,ema,atr,adx,rsi,dh,dl,ob,oi,dtrend,"FILTERED_COOLDOWN")
             return
@@ -1277,9 +1494,27 @@ def evaluate_entry(coin, price=None):
         strat    = "TREND"
         flt      = None
 
+        if strat == "TREND" and hurst < 0.52 and (is_long or is_short):
+            log_dec(coin,price,dp,ema,atr,adx,rsi,dh,dl,ob,oi,dtrend,f"FILTERED_HURST_NO_TREND({hurst:.2f})")
+            is_long = is_short = False
+
         if is_long or is_short:
             sc = "LONG" if is_long else "SHORT"
-            if   adx < adx_threshold:                          flt = f"ADX_LOW({adx:.1f})"
+            # --- VPIN TOXIC FLOW VÉDELEM ---
+            if vpin > 0.72:
+                flt = f"TOXIC_FLOW_VPIN({vpin:.2f})"
+                
+            # --- Z-SCORE CROSS-ASSET ARBITRÁZS ---
+            elif sc == "LONG" and z_score > 2.5:
+                flt = f"Z_SCORE_OVEREXTENDED({z_score:.2f})"
+            elif sc == "LONG" and z_score < -2.2 and CVD_SLOPES.get(coin, 0) > 0:
+                flt = None
+                log.info(f"⚡ Z-SCORE ARBITRÁZS (LONG): {coin} jelentősen lemaradt a BTC-hez képest (Z={z_score:.2f})!")
+            elif sc == "SHORT" and z_score > 2.5 and CVD_SLOPES.get(coin, 0) < 0:
+                flt = None
+                log.info(f"⚡ Z-SCORE ARBITRÁZS (SHORT): {coin} túlszaladt a BTC-hez képest (Z={z_score:.2f})!")
+
+            elif adx < adx_threshold:                          flt = f"ADX_LOW({adx:.1f})"
             elif datetime.now().hour in LOW_LIQUIDITY_HOURS:   flt = "LOW_LIQ_HOUR"
             elif correlated_exposure_count(coin, sc) >= MAX_CORR_POSITIONS: flt = f"CORR_LIMIT({correlated_exposure_count(coin, sc)})"
             elif not vol_ok:                                   flt = "LOW_VOLATILITY"
@@ -1287,7 +1522,7 @@ def evaluate_entry(coin, price=None):
             elif sc=="SHORT" and ob > OB_IMBALANCE_MIN:        flt = f"OB_BULLISH({ob:.2f})"
             elif oi < -OI_CHANGE_THR:                          flt = f"OI_DECLINING({oi:.3f})"
             elif sc=="LONG"  and fr > FUNDING_EXTREME_THR:     flt = f"FUNDING_HIGH({fr:.4f})"
-            elif sc=="SHORT" and fr < -FUNDING_EXTREME_THR:    flt = f"FUNDING_LOW({fr:.4f})"
+            elif sc=="SHORT" and fr < 0:    flt = f"FUNDING_NEGATIVE({fr:.4f})"
             elif get_coin_regime(coin) in ("HIGH_VOL_CHOP","LOW_VOL_CHOP"): flt = f"REGIME_{get_coin_regime(coin)}"
             else:
                 div = detect_rsi_divergence(df_4h)
@@ -1307,6 +1542,18 @@ def evaluate_entry(coin, price=None):
                 is_long=True;  strat="MEAN_REV"
             elif rsi>=RSI_OVERBOUGHT and price>=bbu and count_dir("SHORT")<MAX_CORR_POSITIONS:
                 is_short=True; strat="MEAN_REV"
+            
+            if (is_long or is_short) and strat == "MEAN_REV":
+                if hurst > 0.48:
+                    log_dec(coin,price,dp,ema,atr,adx,rsi,dh,dl,ob,oi,dtrend,f"FILTERED_HURST_NO_REVERT({hurst:.2f})")
+                    is_long = is_short = False
+                elif ou_hl > 12.0:
+                    log_dec(coin,price,dp,ema,atr,adx,rsi,dh,dl,ob,oi,dtrend,f"FILTERED_OU_DRIFT({ou_hl:.1f}h)")
+                    is_long = is_short = False
+
+        if strat == "TREND" and hurst < 0.52 and (is_long or is_short):
+            log_dec(coin,price,dp,ema,atr,adx,rsi,dh,dl,ob,oi,dtrend,f"FILTERED_HURST_NO_TREND({hurst:.2f})")
+            is_long = is_short = False
 
         if is_long or is_short:
             side  = "LONG" if is_long else "SHORT"
@@ -1327,6 +1574,23 @@ def evaluate_entry(coin, price=None):
             qty     = get_qty(coin, stake, price)
             if qty <= 0: return
 
+            # 3. FIX: Meta-Labeler hívás a végrehajtás előtt
+            if evaluate_trade_meta:
+                meta_features = {
+                    "adx": adx,
+                    "rsi": rsi,
+                    "atr_pct": (atr/price)*100,
+                    "don_width_pct": ((dh-dl)/price)*100 if dh>0 else 0,
+                    "dist_ema_pct": ((price-ema)/ema)*100 if ema>0 else 0,
+                    "cvd_slope": CVD_SLOPES.get(coin, 0),
+                    "side": 1.0 if is_long else -1.0
+                }
+                prob = evaluate_trade_meta(meta_features)
+                if prob < 0.50:
+                    log_dec(coin,price,dp,ema,atr,adx,rsi,dh,dl,ob,oi,dtrend,f"FILTERED_META_LABELER({prob:.2f})")
+                    tg_send(f"🤖 META-LABELER szűrte: {side} {coin} (Esély: {prob*100:.1f}%)")
+                    return
+            
             ok, fill = execute_maker_chase(coin, "BUY" if is_long else "SELL", qty)
             if not ok: return
 
@@ -1334,6 +1598,14 @@ def evaluate_entry(coin, price=None):
             with STATE_LOCK:
                 state["active_pos"][coin]     = side
                 state["entry_prices"][coin]   = fill or price
+                state["entry_ts"][coin]       = time.time()
+                state["highest_high"][coin]   = fill or price
+                state["lowest_low"][coin]     = fill or price
+                state["baseline_vol"][coin]   = atr
+                state["entry_ts"][coin]       = time.time()
+                state["highest_high"][coin]   = fill or price
+                state["lowest_low"][coin]     = fill or price
+                state["baseline_vol"][coin]   = atr
                 state["stop_losses"][coin]    = cstop
                 state["target_prices"][coin]  = tgt
                 state["stakes"][coin]         = stake
@@ -1357,6 +1629,7 @@ def manage_open_positions_realtime(current_prices):
         price = current_prices.get(coin)
         if not price: continue
         
+        # 1. Állapot pillanatkép készítése lock alatt
         with STATE_LOCK:
             pos = state["active_pos"].get(coin)
             if not pos: continue
@@ -1367,91 +1640,145 @@ def manage_open_positions_realtime(current_prices):
             stake  = state["stakes"].get(coin,0)
             strat  = state["strategy_used"].get(coin,"")
             raw    = (price-entry)/entry if pos=="LONG" else (entry-price)/entry
-
-            # Break-even
-            if raw>=0.01 and not state["break_even"].get(coin):
-                be = entry*1.001 if pos=="LONG" else entry*0.999
-                if (pos=="LONG" and be>stop) or (pos=="SHORT" and be<stop):
-                    state["stop_losses"][coin]=be; stop=be
-                state["break_even"][coin]=True
-                tg_send(f"🛡️ {coin} BREAK-EVEN! Stop={be:.4f}"); save_state()
-
-            # Részleges profit
-            if raw>=0.02 and not state["partial_taken"].get(coin):
-                half = stake/2.0; hqty = get_qty(coin, half, price)
-                if hqty > 0:
-                    ok, fill = execute_order(coin,"SELL" if pos=="LONG" else "BUY",hqty,order_type="MARKET",price=price,purpose="EXIT")
-                    if ok:
-                        profit_h = (half*LEVERAGE)*raw
-                        state["total_capital"] += profit_h
-                        state["stakes"][coin]   = half; stake=half
-                        state["partial_taken"][coin] = True
-                        fee = apply_fee(half); save_state()
-                        tg_send(f"💰 {coin} RÉSZLEGES: +${profit_h:.2f} | Díj: ${fee:.2f}")
-
-            # Trailing stop + profit target
-            cur_stop   = state["stop_losses"].get(coin,0)
-            exit_trade = False; exit_price=price; pnl=0.0; exit_type=""
-
+            is_break_even = state["break_even"].get(coin)
+            is_partial_taken = state["partial_taken"].get(coin)
+            
             now_ts = time.time()
             if "_atr_cache" not in state: state["_atr_cache"] = {}
-            if coin not in state["_atr_cache"] or now_ts - state["_atr_cache"][coin].get("ts", 0) > 300:
-                df_4h = fetch_klines(coin, "4h", limit=30)
-                if df_4h.empty: continue
-                c_atr = ind_atr(df_4h, ATR_LEN)
-                c_em  = ind_eff_mult(df_4h, c_atr)
+            needs_atr_update = (coin not in state["_atr_cache"] or now_ts - state["_atr_cache"][coin].get("ts", 0) > 300)
+
+        # 2. Hálózati IO lock NÉLKÜL (REST)
+        if needs_atr_update:
+            df_4h = fetch_klines(coin, "4h", limit=30)
+            if df_4h.empty: continue
+            c_atr = ind_atr(df_4h, ATR_LEN)
+            c_em  = ind_eff_mult(df_4h, c_atr)
+            with STATE_LOCK:
                 state["_atr_cache"][coin] = {"ts": now_ts, "atr": c_atr, "em": c_em}
+                atr, em = c_atr, c_em
+        else:
+            with STATE_LOCK:
+                atr = state["_atr_cache"][coin]["atr"]
+                em  = state["_atr_cache"][coin]["em"]
+                
+        # Lock NÉLKÜL számoljuk a változásokat
+        new_stop = None
+        new_break_even = False
+        execute_partial = False
+        execute_exit = False
+        exit_type = ""
+        pnl = 0.0
+
+        # Break-even
+        if raw >= 0.01 and not is_break_even:
+            be = entry * 1.001 if pos == "LONG" else entry * 0.999
+            if (pos == "LONG" and be > stop) or (pos == "SHORT" and be < stop):
+                new_stop = be
+            new_break_even = True
+
+        # Részleges profit
+        if raw >= 0.02 and not is_partial_taken:
+            execute_partial = True
+
+        # Parabolic Chandelier Exit (quant_arsenal module)
+        cur_stop = new_stop if new_stop is not None else stop
+        
+        # BOCPD esemény esetén azonnali stop szűkítés (0.5 ATR)
+        bocpd = state.get("bocpd_event", False)
+        
+        with STATE_LOCK:
+            entry_ts = state["entry_ts"].get(coin, time.time())
+            hh = state["highest_high"].get(coin, price)
+            ll = state["lowest_low"].get(coin, price)
+            base_vol = state["baseline_vol"].get(coin, atr)
             
-            atr = state["_atr_cache"][coin]["atr"]
-            em  = state["_atr_cache"][coin]["em"]
+            if pos == "LONG" and price > hh:
+                hh = price
+                state["highest_high"][coin] = hh
+            elif pos == "SHORT" and price < ll:
+                ll = price
+                state["lowest_low"][coin] = ll
+                
+        eff_mult = 0.5 if bocpd else em
+        
+        ns = calculate_chandelier_exit(
+            entry_price=entry,
+            current_price=price,
+            peak_price=hh if pos == "LONG" else ll,
+            side=pos,
+            atr=atr,
+            open_ts=entry_ts,
+            current_vol=atr / price,  # Approximation as current_vol
+            baseline_vol=base_vol / price if base_vol > 0 else 0.03,
+            base_mult=eff_mult
+        )
+        
+        if pos == "LONG":
+            if ns > cur_stop: new_stop = ns; cur_stop = ns
+            if strat == "MEAN_REV" and tgt > 0 and price >= tgt:
+                pnl = (tgt - entry) / entry; execute_exit = True; exit_type = "PROFIT_TARGET"
+            elif price <= cur_stop:
+                pnl = (cur_stop - entry) / entry; execute_exit = True; exit_type = "STOP"
+        elif pos == "SHORT":
+            if ns < cur_stop: new_stop = ns; cur_stop = ns
+            if strat == "MEAN_REV" and tgt > 0 and price <= tgt:
+                pnl = (entry - tgt) / entry; execute_exit = True; exit_type = "PROFIT_TARGET"
+            elif price >= cur_stop:
+                pnl = (entry - cur_stop) / entry; execute_exit = True; exit_type = "STOP"
 
-            if pos=="LONG":
-                ns = price-atr*em
-                if ns>cur_stop: state["stop_losses"][coin]=ns; cur_stop=ns
-                if strat=="MEAN_REV" and tgt>0 and price>=tgt:
-                    pnl=(tgt-entry)/entry; exit_price=tgt; exit_trade=True; exit_type="PROFIT_TARGET"
-                elif price<=cur_stop:
-                    pnl=(cur_stop-entry)/entry; exit_trade=True; exit_type="STOP"
-            elif pos=="SHORT":
-                ns = price+atr*em
-                if ns<cur_stop: state["stop_losses"][coin]=ns; cur_stop=ns
-                if strat=="MEAN_REV" and tgt>0 and price<=tgt:
-                    pnl=(entry-tgt)/entry; exit_price=tgt; exit_trade=True; exit_type="PROFIT_TARGET"
-                elif price>=cur_stop:
-                    pnl=(entry-cur_stop)/entry; exit_trade=True; exit_type="STOP"
+        # 3. Műveletek végrehajtása (network IO) lock NÉLKÜL
+        if execute_partial:
+            half = stake / 2.0; hqty = get_qty(coin, half, price)
+            if hqty > 0:
+                ok, _ = execute_order(coin, "SELL" if pos == "LONG" else "BUY", hqty, order_type="MARKET", price=price, purpose="EXIT")
+                if ok:
+                    profit_h = (half * LEVERAGE) * raw
+                    with STATE_LOCK:
+                        state["total_capital"] += profit_h
+                        state["stakes"][coin] = half
+                        state["partial_taken"][coin] = True
+                        fee = apply_fee(half)
+                        save_state()
+                    tg_send(f"💰 {coin} RÉSZLEGES: +${profit_h:.2f} | Díj: ${fee:.2f}")
 
-        if exit_trade:
-            use_price = price
+        if execute_exit:
             qty = get_qty(coin, stake, price)
-            ok, fill = execute_order(coin,"SELL" if pos=="LONG" else "BUY",
-                                     qty, order_type="MARKET",
-                                     price=use_price, purpose="EXIT")
+            ok, fill = execute_order(coin, "SELL" if pos == "LONG" else "BUY", qty, order_type="MARKET", price=price, purpose="EXIT")
             if ok:
-                actual_pnl = ((fill-entry)/entry if pos=="LONG" else (entry-fill)/entry) if fill else pnl
+                actual_pnl = ((fill - entry) / entry if pos == "LONG" else (entry - fill) / entry) if fill else pnl
                 with STATE_LOCK:
-                    profit = (stake*LEVERAGE)*actual_pnl
-                    roi    = actual_pnl*LEVERAGE*100
-                    slip   = (fill-price)/price*100 if fill and price else 0.0
+                    profit = (stake * LEVERAGE) * actual_pnl
+                    roi = actual_pnl * LEVERAGE * 100
+                    slip = (fill - price) / price * 100 if fill and price else 0.0
 
                     state["total_capital"] += profit
                     fee = apply_fee(stake)
                     update_score(coin, actual_pnl)
                     register_result(actual_pnl)
 
-                    log_trade_db(coin,pos,strat,exit_type,entry,fill or price,
-                                 stake,profit,roi,fee,slip)
-                    # We skip log_dec here for simplicity or recreate dp, ema...
+                    log_trade_db(coin, pos, strat, exit_type, entry, fill or price, stake, profit, roi, fee, slip)
                     
-                    state["active_pos"][coin]    = None
-                    state["break_even"][coin]    = False
+                    state["active_pos"][coin] = None
+                    state["break_even"][coin] = False
                     state["partial_taken"][coin] = False
                     save_state()
 
-                em_j = "✅" if profit>0 else "❌"
+                em_j = "✅" if profit > 0 else "❌"
                 tg_send(f"{em_j} ZÁRÁS: {pos} {coin} [{exit_type}]\n"
                         f"Ár: {fill or price:.4f} | ROI: {roi:.2f}% (${profit:.2f})\n"
                         f"Slip: {slip:.3f}% | Díj: ${fee:.2f}\n"
                         f"Tőke: ${state['total_capital']:.2f}")
+        else:
+            # Csak állapotot frissítünk (Stop loss, Break even)
+            if new_stop is not None or new_break_even:
+                with STATE_LOCK:
+                    if new_stop is not None:
+                        state["stop_losses"][coin] = new_stop
+                    if new_break_even:
+                        state["break_even"][coin] = True
+                    save_state()
+                if new_break_even:
+                    tg_send(f"🛡️ {coin} BREAK-EVEN! Stop={new_stop:.4f}")
 
 # ══════════════════════════════════════════════════════════════════
 #  🔧  ÖNDIAGNÓZIS
@@ -1548,6 +1875,10 @@ def main():
         lambda: threading.Thread(target=update_vol_filter, daemon=True).start())
     schedule.every(4).hours.do(
         lambda: threading.Thread(target=update_correlation_matrix, daemon=True).start())
+    schedule.every(15).minutes.do(
+        lambda: threading.Thread(target=update_bocpd, daemon=True).start())
+    schedule.every(15).minutes.do(
+        lambda: threading.Thread(target=update_bocpd, daemon=True).start())
     schedule.every().day.at("20:00").do(lambda: tg_send(
         f"🌙 NAPI JELENTÉS\n"
         f"📊 Tőke: ${state['total_capital']:.2f}\n"
@@ -1556,13 +1887,17 @@ def main():
         f"🪙 Aktív coinok: {', '.join(state['active_symbols'])}"
     ))
     schedule.every().day.at("00:00").do(reset_daily_loss_window)
+    schedule.every().sunday.at("23:50").do(
+        lambda: threading.Thread(target=reporter.generate_and_send_weekly_report, args=(DB_PATH,), daemon=True).start())
+    schedule.every().day.at("02:00").do(
+        lambda: threading.Thread(target=db_maintenance, daemon=True).start())
 
     threading.Thread(target=train_regime_models_all, daemon=True).start()
     threading.Thread(target=update_vol_filter, daemon=True).start()
     threading.Thread(target=update_correlation_matrix, daemon=True).start()
 
     log.info("🔌 WebSocket szál indítása...")
-    ws_thread = threading.Thread(target=start_websocket_manager, args=(state["active_symbols"],), daemon=True)
+    ws_thread = threading.Thread(target=start_websocket_manager, daemon=True)
     ws_thread.start()
     
     log.info("✅ Főciklus indul...")
@@ -1643,8 +1978,7 @@ def main():
         except KeyboardInterrupt:
             tg_send("⏹️ Bot leállítva."); break
         except Exception as e:
-            log.error("Főciklus hiba: %s", e)
-            tg_send(f"⚠️ Hiba: {e}"); time.sleep(10)
+            raise
 
     save_state()
     log.info("Bot leállt.")
